@@ -1,7 +1,6 @@
 import lib.*;
 
 import java.io.*;
-import java.rmi.Remote;
 import java.rmi.RemoteException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -30,7 +29,7 @@ public class RaftNode implements MessageHandling {
     private int[] matchIndices;
 
     // Randomized the timeout value of each node
-    private int timeOut;
+    private int electionTimeout;
 
     /* The paper's section 5.2 mentions election timeouts in the range of 150 to 300 milliseconds.
      * Such a range only makes sense if the leader sends heartbeats considerably more often than
@@ -42,7 +41,12 @@ public class RaftNode implements MessageHandling {
     // Interval of sending the heartbeat
     // The tester limits you to 10 heartbeats per second
     private static final int heartbeatInterval = 100;
-    private LinkedBlockingDeque<Boolean> heartBeatQueue;
+    private LinkedBlockingDeque<HeartBeat> heartBeatQueue;
+
+    // private class for mimicking the heartbeat
+    private class HeartBeat {
+        int heartbeatID;
+    }
 
 
     // Count the number of votes;
@@ -50,6 +54,9 @@ public class RaftNode implements MessageHandling {
 
     // State
     private String state;
+
+
+    private Object lock;
 
     public RaftNode(int port, int id, int num_peers) {
         this.id = id;
@@ -59,6 +66,7 @@ public class RaftNode implements MessageHandling {
         this.currentTerm = 0;
         this.votedFor = NOT_VOTED;
         this.entries = new ArrayList<LogEntry>();
+        this.entries.add(new LogEntry(0, 0, null));
         this.commitIndex = 0;
         this.lastApplied = 0;
 
@@ -67,11 +75,14 @@ public class RaftNode implements MessageHandling {
         Arrays.fill(nextIndices, 1);
 
         Random random = new Random();
-        this.timeOut = maxTimeoutVal - random.nextInt() % minTimeoutVal;
+        this.electionTimeout = maxTimeoutVal - random.nextInt() % minTimeoutVal;
         this.heartBeatQueue = new LinkedBlockingDeque<>();
 
         this.voteCount = 0;
         this.state = "follower";
+
+
+        this.lock = new Object();
 
         new Thread(new Runnable() {
             @Override
@@ -81,145 +92,272 @@ public class RaftNode implements MessageHandling {
         }).start();
     }
 
-    public void perform() {
-        if (this.state.equals("follower") || this.state.equals("candidate")) {
-            try {
-                Boolean ans = heartBeatQueue.poll(this.timeOut, TimeUnit.MILLISECONDS);
-                if (ans == null) {
-                    // If timeout, change its state to candidate and starts election.
-                    this.state = "candidate";
-                    this.currentTerm++;
-                    this.voteCount++;
-                    this.votedFor = this.id;
+    private void perform() {
+        boolean live = true;
+        while (live) {
 
-                    for (int i = 0; i < num_peers; i++) {
-                        if (i == this.id) {
-                            continue;
-                        }
-                        RequestVoteArgs requestArgs = new RequestVoteArgs(this.currentTerm,
-                                                                          this.id,
-                                                                          this.entries.get(entries.size() - 1).getIndex(),
-                                                                          this.entries.get(entries.size() - 1).getTerm());
-                        RequestVoteThread requestThread = new RequestVoteThread(this.id, i, requestArgs);
-                        requestThread.run();
-                    }
-                }
+            boolean isLeader = this.state.equals("leader");
+            int timeout = isLeader ? heartbeatInterval : this.electionTimeout;
+            HeartBeat heartbeat = null;
+
+            try {
+                heartbeat = heartBeatQueue.poll(timeout, TimeUnit.MILLISECONDS);
 
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                live = false;
+                System.out.println(e.getMessage());
             }
-
-        } else {
-            leaderBroadCast();
-        }
-    }
-
-    private class AppendEntryThread extends Thread {
-        private AppendEntriesArgs appendArgs;
-        private int destID;
-
-        AppendEntryThread(int destID, AppendEntriesArgs args) {
-            this.appendArgs = args;
-            this.destID = destID;
-        }
-
-        @Override
-        public void run() {
-            Message request = serialize(MessageType.AppendEntriesArgs, id, this.destID, this.appendArgs);
-            Message reply;
-
-            try {
-                reply = lib.sendMessage(request);
-                // failure
-                if (reply == null) {
-                    return;
+            // if there's heartbeat from the leader
+            if (heartbeat != null) {
+                if (this.state.equals("candidate")) {
+                    this.state = "follower";
                 }
-                AppendEntriesReply appendReply = (AppendEntriesReply) deserialize(reply);
+            } else { // if the participant cannot hear the heartbeat
+                if (isLeader){ // if the node is the leader, then send out heartbeat AppendEntries RPCs
+
+                    for (int i = 0; i < num_peers; i++) {
+                        if (i != id) {
+
+                            // for the checkpoint, we only need to send out an empty or invalid args
+                            // for sending heartbeat or electing a new leader.
+                            AppendEntriesArgs args = new AppendEntriesArgs(currentTerm, id, -1, -1,
+                                                            new ArrayList<>(), -1);
+                            AppendEntryThread aThread = new AppendEntryThread(args, i);
+                            aThread.start();
+
+                        }
+                    }
 
 
-            } catch (RemoteException e) {
-                e.printStackTrace();
+                } else { // if the current node is a follower or candidate, then start election!
+                    // increment the term number and vote for itself
+                    // request votes from all other peers
+                    state = "candidate";
+                    currentTerm++;
+                    votedFor = this.id;
+                    voteCount++;
+
+                    for (int i = 0; i < num_peers; i++) {
+                        if (i != id) {
+                            int lastLogTerm = entries.get(entries.size() - 1).getTerm();
+                            int lastLogIndex = entries.get(entries.size() - 1).getTerm();
+                            RequestVoteArgs args = new RequestVoteArgs(currentTerm, id, lastLogIndex, lastLogTerm);
+                            RequestVoteThread rThread = new RequestVoteThread(args, i);
+                            rThread.start();
+                        }
+                    }
+                }
             }
         }
     }
 
     private class RequestVoteThread extends Thread {
-        private int srcID;
-        private int destID;
-        private RequestVoteArgs requestArgs;
-        RequestVoteThread(int srcID, int destID, RequestVoteArgs args) {
-            this.srcID = srcID;
+        RequestVoteArgs args;
+        int destID;
+        public RequestVoteThread(RequestVoteArgs args, int destID) {
+            this.args = args;
             this.destID = destID;
-            this.requestArgs = args;
         }
 
         @Override
-        public void run() {
-            // pack up the Message and send those msgs to the peers using TransportLib
-            // then unpack and take actions
-            Message request = serialize(MessageType.RequestVoteArgs, this.srcID, this.destID, requestArgs);
-            Message reply;
-            try {
-                reply = lib.sendMessage(request);
-                // failure
-                if (reply == null) {
-                    return;
-                }
+        public synchronized void run() {
+            Message msg = serialize(MessageType.RequestVoteArgs, id, destID, args);
+            Message reply = sendMessageViaLib(msg);
+            if (reply == null) {
+                return;
+            }
+            synchronized (lock) {
+                RequestVoteReply replyObject = (RequestVoteReply) deserialize(reply);
+                int replyTerm = replyObject.getTerm();
+                boolean replyVoteGranted = replyObject.isVoteGranted();
 
-                RequestVoteReply deserializedReply = (RequestVoteReply) deserialize(reply);
-                boolean voteGranted = deserializedReply.voteGranted;
-                int replierTerm = deserializedReply.term;
-
-
-                if (replierTerm < currentTerm) {
-                    return;
-                } else if (replierTerm > currentTerm) { // replier is more up-to-date, step down
+                // if the current term on this node is smaller than the replied term,
+                // meaning that there's a more up-to-date node is requesting votes and election.
+                // this node should step down immediately and become a follower.
+                if (currentTerm < replyTerm || state.equals("follower")) {
+                    // step down and set the term to the most up-to-date one
                     state = "follower";
-                    voteCount = 0;
-                    currentTerm = replierTerm;
-                    votedFor = -1;
-                } else {
-                    if (voteGranted) {
-                        voteCount++;
-                        if (voteCount > num_peers / 2) {
-                            state = "leader";
-                            heartBeatQueue.offer(true);
-                            for (int i = 0; i < num_peers; i++) {
-                                nextIndices[i] = entries.get(entries.size() - 1).getIndex() + 1;
-                                matchIndices[i] = 0;
-                            }
-                            heartBeatQueue.offer(true);
+                    currentTerm = replyTerm;
+                    votedFor = NOT_VOTED;
+                } else if (replyVoteGranted) {
+                    voteCount++;
+                    if (voteCount > (num_peers / 2)) {
+                        state = "leader";
+                        for (int i = 0; i < num_peers; i++) {
+                            // set the nextIndex of all peers to be the next index of the current leader
+                            // in order to do the checking and cleanup during the normal operation
+                            nextIndices[i] = entries.get(entries.size() - 1).getIndex() + 1;
+                            matchIndices[i] = 0;
                         }
                     }
+                    heartBeatQueue.add(new HeartBeat());
                 }
-            } catch (RemoteException e) {
-                e.printStackTrace();
             }
         }
     }
 
-    private void leaderBroadCast() {
-        for (int i = 0; i < num_peers; i++) {
-            if (i == id) {
-                continue;
+
+    private class AppendEntryThread extends Thread {
+        AppendEntriesArgs args;
+        int destID;
+
+        public AppendEntryThread(AppendEntriesArgs args, int destID) {
+            this.args = args;
+            this.destID = destID;
+        }
+
+        @Override
+        public synchronized void run() {
+            if (!state.equals("leader") || currentTerm != args.getTerm()) {
+                return;
             }
 
+            Message msg = serialize(MessageType.AppendEntriesArgs, id, destID, args);
+            Message reply = sendMessageViaLib(msg);
+            if (reply == null) {
+                return;
+            }
 
-            int prevLogIndex = this.nextIndices[i] - 1;
-            int prevLogTerm = entries.get(prevLogIndex).getTerm();
+            synchronized (lock) {
+                AppendEntriesReply replyObject = (AppendEntriesReply) deserialize(reply);
+                int term = replyObject.getTerm();
+                boolean success = replyObject.isSuccess();
+                int nextIndex = replyObject.getNextIndex();
 
-            List<LogEntry> toBeAppendEntries = entries.subList(prevLogIndex + 1, entries.size());
-            AppendEntriesArgs appendArgs = new AppendEntriesArgs(this.currentTerm, this.id, prevLogIndex, prevLogTerm,
-                                                                 toBeAppendEntries, commitIndex);
-            AppendEntryThread appendThread = new AppendEntryThread(i, appendArgs);
-            appendThread.start();
+                // if the term of the sender (leader) has smaller (older) term than the receiver, the leader steps
+                // down to be a follower and set the term to the current max term it learned from the "new leader"
+                if (currentTerm < term) {
+                    state = "follower";
+                    currentTerm = term;
+                    votedFor = NOT_VOTED;
+                }
+            }
         }
     }
 
+
+    private Message sendMessageViaLib(Message msg) {
+        Message reply = null;
+        try {
+            reply = lib.sendMessage(msg);
+            if (reply == null) {
+                return null;
+            }
+        } catch (RemoteException e) {
+            return null;
+        }
+        return reply;
+    }
+
+
+    /****************************** RPC calls of Sending Messages ************************/
+
+    // execute corresponding action when a candidate asking for a vote
+    private synchronized RequestVoteReply requestVote(RequestVoteArgs args) {
+
+        int requestTerm = args.getTerm();
+        int requestLastLogTerm = args.getLastLogTerm();
+        int requestLastLogIndex = args.getLastLogIndex();
+        int requestCandidateID = args.getCandidateId();
+
+        // if the node's term is larger than the candidate, then it won't grant its vote.
+        // so set the default voteGranted to false;
+        boolean voteGranted = false;
+//
+//        if (currentTerm > requestTerm) {
+//            voteGranted = false;
+//        }
+
+        // if the candidate's term is larger than the voter, set the voter as Follower
+        // and set the voted_for as -1 because we still don't know if there's an most up-to-date log in the candidate or not
+        // need to decide if it is going to give out the vote based on the comparison between logs of candidate and voter
+        if (currentTerm <= requestTerm) {
+            if (currentTerm < requestTerm) {
+                currentTerm = requestTerm;
+                state = "follower";
+                votedFor = NOT_VOTED;
+            }
+            LogEntry lastEntry = entries.get(entries.size() - 1);
+            int lastLogTerm = lastEntry.getTerm();
+            int lastLogIndex = lastEntry.getIndex();
+            // Raft User Study p. 17 -> voting server will denies vote if its log is "more complete
+            // otherwise if the node hasn't voted yet, it'll grant the vote to the requesting candidate
+            // otherwise, if it hasn't voted yet, grant the vote to the candidate who is requesting.
+            if ((votedFor == NOT_VOTED) &&
+                    (requestLastLogTerm > lastLogTerm ||
+                            (requestLastLogTerm == lastLogTerm && requestLastLogIndex >= lastLogIndex))) {
+                votedFor = requestCandidateID;
+                heartBeatQueue.add(new HeartBeat());
+                voteGranted = true;
+
+            }
+        }
+        return new RequestVoteReply(requestTerm, voteGranted);
+    }
+
+    // execute corresponding action when the leader wants to append things to the node
+    private synchronized AppendEntriesReply appendEntries(AppendEntriesArgs args) {
+        int requestTerm = args.getTerm();
+
+        boolean success = false;
+        int newestTerm = -1;
+        // if the node has newer term than the requesting leader, then reply no to the appendEntries RPC
+        if (currentTerm > requestTerm) {
+            success = false;
+            newestTerm = currentTerm;
+        } else if (currentTerm < requestTerm) {
+            success = true;
+            currentTerm = requestTerm;
+            state = "follower";
+            votedFor = NOT_VOTED;
+            newestTerm = requestTerm;
+        }
+        heartBeatQueue.add(new HeartBeat());
+        return new AppendEntriesReply(newestTerm, success, -1);
+
+    }
+
+    /*****************************Implementation of MessageHandling **********************/
+    @Override
+    public StartReply start(int command) {
+        return null;
+    }
+
+
+    @Override
+    public synchronized GetStateReply getState() {
+            boolean isLeader = this.state.equals("leader");
+            int term = this.currentTerm;
+            return new GetStateReply(term, isLeader);
+    }
+
+    @Override
+    public Message deliverMessage(Message message) {
+        Message replyMsg = null;
+        MessageType msgType = message.getType();
+        int srcID = message.getSrc();
+        int destID = message.getDest();
+
+        MessageType replyType = msgType == MessageType.RequestVoteArgs ?
+                MessageType.RequestVoteReply : MessageType.AppendEntriesReply;
+
+        byte[] reply_stream = null;
+        Serializable reply = null;
+        Object args = deserialize(message);
+
+        if (msgType == MessageType.RequestVoteArgs) {
+            reply = requestVote((RequestVoteArgs)args);
+
+        } else if (msgType == MessageType.AppendEntriesArgs) {
+            reply = appendEntries((AppendEntriesArgs)args);
+        }
+        replyMsg = serialize(replyType, destID, srcID, reply);
+        return replyMsg;
+    }
 
     /******************************* Serialize and Deserialize *************************************/
 
-    public Message serialize(MessageType type, int src_addr, int dest_addr, Object object) {
+    private Message serialize(MessageType type, int srcID, int destID, Object object) {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         ObjectOutputStream ob = null;
         byte[] byteArray = null;
@@ -240,10 +378,10 @@ public class RaftNode implements MessageHandling {
             }
         }
 
-        return new Message(type, src_addr, dest_addr, byteArray);
+        return new Message(type, srcID, destID, byteArray);
     }
 
-    public Object deserialize(Message message) {
+    private Object deserialize(Message message) {
         byte[] byteArray = message.getBody();
 
         ByteArrayInputStream bis = new ByteArrayInputStream(byteArray);
@@ -262,29 +400,9 @@ public class RaftNode implements MessageHandling {
                 System.out.println("");
             }
         }
-
         return in;
     }
 
-    /***********************************************************************************/
-
-    /*
-     *call back.
-     */
-    @Override
-    public StartReply start(int command) {
-        return null;
-    }
-
-    @Override
-    public GetStateReply getState() {
-        return null;
-    }
-
-    @Override
-    public Message deliverMessage(Message message) {
-        return null;
-    }
 
     //main function
     public static void main(String args[]) throws Exception {
